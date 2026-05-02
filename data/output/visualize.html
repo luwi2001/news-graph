@@ -303,7 +303,7 @@
         async function loadFeeds() {
             try {
                 console.log('DEBUG loadFeeds: 开始加载...');
-                const res = await fetch('http://localhost:8082/api/feeds');
+                const res = await fetch('/api/feeds');
                 const data = await res.json();
                 console.log('DEBUG loadFeeds: 收到数据', data.feeds.length, '个feeds');
                 
@@ -346,8 +346,8 @@
             
             try {
                 const url = currentFeedId 
-                    ? `http://localhost:8082/api/graph?feed_id=${currentFeedId}`
-                    : 'http://localhost:8082/api/graph';
+                    ? `/api/graph?feed_id=${currentFeedId}`
+                    : '/api/graph';
                 console.log('DEBUG loadGraph:', 'selectedValue=', selectedValue, 'currentFeedId=', currentFeedId, 'url=', url);
                 const res = await fetch(url);
                 const data = await res.json();
