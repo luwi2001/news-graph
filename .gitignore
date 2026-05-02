@@ -51,3 +51,6 @@ data/output/*.svg
 *.log
 nohup.out
 /tmp/
+
+# 项目导览（本地文档，不上传）
+PROJECT_GUIDE.md
