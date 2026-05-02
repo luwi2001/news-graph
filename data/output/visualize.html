@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>新闻图谱可视化</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Microsoft YaHei', sans-serif;
+            background: #f5f5f5;
+            min-height: 100vh;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: white;
+            padding: 20px 30px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+        }
+        
+        .header h1 { font-size: 24px; font-weight: 500; }
+        .header .stats { font-size: 14px; opacity: 0.8; margin-top: 5px; }
+        
+        .controls {
+            background: white;
+            padding: 15px 30px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .controls input, .controls select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .controls button {
+            background: #4a90d9;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        .controls button:hover { background: #357abd; }
+        
+        .timeline-container {
+            padding: 30px;
+            overflow-x: auto;
+            overflow-y: hidden;
+        }
+        
+        .timeline {
+            display: flex;
+            flex-direction: row;
+            gap: 50px;
+            min-width: max-content;
+            position: relative;
+            padding-bottom: 50px;
+        }
+        
+        .day-column {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 15px;
+            min-width: 200px;
+        }
+        
+        .date-label {
+            width: 100%;
+            max-width: 180px;
+            padding: 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 14px;
+            font-weight: 500;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            flex-shrink: 0;
+        }
+        
+        .date-label .weekday {
+            font-size: 11px;
+            opacity: 0.8;
+            margin-top: 2px;
+        }
+        
+        .news-col {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            align-items: center;
+        }
+        
+        .news-card {
+            width: 180px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            overflow: hidden;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            position: relative;
+        }
+        
+        .news-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.15);
+        }
+        
+        .news-card.selected {
+            box-shadow: 0 0 0 3px #4a90d9;
+        }
+        
+        .news-card.dimmed {
+            opacity: 0.25;
+        }
+        
+        .news-card .title {
+            padding: 10px;
+            font-size: 12px;
+            line-height: 1.5;
+            color: #333;
+            display: -webkit-box;
+            -webkit-line-clamp: 4;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            max-height: 90px;
+        }
+        
+        .news-card .meta {
+            padding: 6px 10px;
+            background: #f8f9fa;
+            font-size: 10px;
+            color: #888;
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .news-card .feed-badge {
+            padding: 2px 5px;
+            border-radius: 3px;
+            font-size: 9px;
+            background: #e8f4ff;
+            color: #4a90d9;
+        }
+        
+        /* 边连接线 SVG */
+        .edges-svg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 1;
+        }
+        
+        .edge-line {
+            stroke: #ffa500;
+            stroke-width: 2;
+            stroke-opacity: 0.35;
+            fill: none;
+            transition: stroke-opacity 0.2s, stroke-width 0.2s;
+        }
+        
+        .edge-line.highlight {
+            stroke: #ff4500;
+            stroke-width: 3;
+            stroke-opacity: 1;
+        }
+        
+        .edge-line.dimmed {
+            stroke-opacity: 0.03;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 50px;
+            color: #888;
+            font-size: 16px;
+        }
+        
+        .node-info-panel {
+            position: fixed;
+            right: 20px;
+            top: 100px;
+            width: 380px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+            padding: 20px;
+            max-height: 70vh;
+            overflow-y: auto;
+            z-index: 100;
+            display: none;
+        }
+        
+        .node-info-panel.show { display: block; }
+        
+        .node-info-panel h3 {
+            font-size: 16px;
+            margin-bottom: 10px;
+            color: #333;
+        }
+        
+        .node-info-panel .link {
+            color: #4a90d9;
+            font-size: 12px;
+            word-break: break-all;
+        }
+        
+        .node-info-panel .neighbors {
+            margin-top: 15px;
+        }
+        
+        .node-info-panel .neighbor-item {
+            padding: 10px;
+            background: #f5f5f5;
+            border-radius: 4px;
+            margin-bottom: 8px;
+            font-size: 12px;
+        }
+        
+        .node-info-panel .neighbor-item .weight {
+            color: #ffa500;
+            font-weight: bold;
+        }
+        
+        .close-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: none;
+            border: none;
+            font-size: 20px;
+            cursor: pointer;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📰 新闻图谱可视化</h1>
+        <div class="stats" id="stats">加载中...</div>
+    </div>
+    
+    <div class="controls">
+        <label>RSS 源
+            <select id="feed-select" onchange="loadGraph()">
+                <option value="">加载中...</option>
+            </select>
+        </label>
+        <label>阈值 ≥ 
+            <input type="number" id="min-weight" value="0.7" step="0.05" min="0" max="1" style="width:60px">
+        </label>
+        <button onclick="loadGraph()">应用</button>
+        <button onclick="fitView()">适应窗口</button>
+    </div>
+    
+    <div class="timeline-container" id="container">
+        <div class="loading" id="loading">加载数据中...</div>
+    </div>
+    
+    <div class="node-info-panel" id="info-panel">
+        <button class="close-btn" onclick="closePanel()">×</button>
+        <h3 id="info-title">标题</h3>
+        <div class="link" id="info-link"></div>
+        <div class="meta" id="info-meta"></div>
+        <div class="neighbors" id="info-neighbors"></div>
+    </div>
+    
+    <script>
+        let graphData = { nodes: [], edges: [] };
+        let selectedNode = null;
+        let feedMap = {};  // id -> title
+        let currentFeedId = null;
+        
+        function extractDate(pubDate) {
+            if (!pubDate) return 'unknown';
+            const m = pubDate.match(/(\d{4}-\d{2}-\d{2})/);
+            if (m) return m[1];
+            const d = new Date(pubDate);
+            if (!isNaN(d)) return d.toISOString().split('T')[0];
+            return 'unknown';
+        }
+        
+        async function loadFeeds() {
+            try {
+                console.log('DEBUG loadFeeds: 开始加载...');
+                const res = await fetch('http://localhost:8082/api/feeds');
+                const data = await res.json();
+                console.log('DEBUG loadFeeds: 收到数据', data.feeds.length, '个feeds');
+                
+                const select = document.getElementById('feed-select');
+                select.innerHTML = '';
+                
+                data.feeds.forEach(f => {
+                    feedMap[f.id] = f.title;
+                    const opt = document.createElement('option');
+                    opt.value = String(f.id);
+                    opt.textContent = f.title;
+                    select.appendChild(opt);
+                });
+                
+                if (data.feeds.length > 0) {
+                    currentFeedId = data.feeds[0].id;
+                    select.value = String(currentFeedId);
+                    console.log('DEBUG loadFeeds: 默认选择', currentFeedId, feedMap[currentFeedId]);
+                }
+                
+                loadGraph();
+            } catch (e) {
+                console.error('加载 feeds 失败:', e);
+                document.getElementById('stats').textContent = '加载 feeds 失败: ' + e.message;
+            }
+        }
+        
+        async function loadGraph() {
+            const minWeight = parseFloat(document.getElementById('min-weight').value);
+            const feedSelect = document.getElementById('feed-select');
+            
+            // 获取当前选中的 feed_id（防御性写法）
+            let selectedValue = '';
+            if (feedSelect.selectedIndex >= 0 && feedSelect.options[feedSelect.selectedIndex]) {
+                selectedValue = feedSelect.options[feedSelect.selectedIndex].value;
+            }
+            currentFeedId = selectedValue ? parseInt(selectedValue) : null;
+            
+            document.getElementById('container').innerHTML = '<div class="loading" id="loading">加载数据中...</div>';
+            
+            try {
+                const url = currentFeedId 
+                    ? `http://localhost:8082/api/graph?feed_id=${currentFeedId}`
+                    : 'http://localhost:8082/api/graph';
+                console.log('DEBUG loadGraph:', 'selectedValue=', selectedValue, 'currentFeedId=', currentFeedId, 'url=', url);
+                const res = await fetch(url);
+                const data = await res.json();
+                
+                const filteredEdges = data.edges.filter(e => e.weight >= minWeight);
+                const connectedNodes = new Set();
+                filteredEdges.forEach(e => {
+                    connectedNodes.add(e.source);
+                    connectedNodes.add(e.target);
+                });
+                
+                const nodes = data.nodes.filter(n => connectedNodes.has(n.id));
+                
+                const dayGroups = {};
+                nodes.forEach(n => {
+                    const date = extractDate(n.pub_date);
+                    if (!dayGroups[date]) dayGroups[date] = [];
+                    dayGroups[date].push(n);
+                });
+                
+                graphData = { 
+                    nodes: nodes.reduce((acc, n) => { acc[n.id] = n; return acc; }, {}),
+                    edges: filteredEdges,
+                    dayGroups: dayGroups
+                };
+                
+                const feedName = currentFeedId ? (feedMap[currentFeedId] || '全部') : '全部';
+                console.log('DEBUG loadGraph:', 'select.value=', feedSelect.value, 'currentFeedId=', currentFeedId, 'url=', url);
+                document.getElementById('stats').textContent = 
+                    `${feedName} | ${data.stats.nodeCount} 节点, ${data.stats.edgeCount} 边 | 可视化: ${nodes.length} 节点, ${filteredEdges.length} 边`;
+                
+                renderTimeline();
+                
+            } catch (e) {
+                console.error(e);
+                document.getElementById('container').innerHTML = 
+                    '<div class="loading">加载失败: ' + escapeHtml(e.message) + '</div>';
+            }
+        }
+        
+        // Barycenter 排序算法：让跨天边的 y 坐标尽量接近
+        function optimizeLayout(dayGroups, edges) {
+            const dates = Object.keys(dayGroups).sort();
+            
+            // 建立 date -> index 映射
+            const dateIndex = {};
+            dates.forEach((d, i) => dateIndex[d] = i);
+            
+            // 每天节点列表 + 当前索引位置
+            const dayNodes = {};
+            dates.forEach(d => {
+                dayNodes[d] = dayGroups[d].map((n, i) => ({ ...n, _pos: i }));
+            });
+            
+            // 边的节点位置映射
+            function getNodeDayIndex(nodeId) {
+                for (const d of dates) {
+                    const idx = dayNodes[d].findIndex(n => n.id === nodeId);
+                    if (idx >= 0) return { date: d, index: idx };
+                }
+                return null;
+            }
+            
+            // 迭代优化 5 轮
+            for (let iter = 0; iter < 5; iter++) {
+                dates.forEach((date, dayIdx) => {
+                    const nodes = dayNodes[date];
+                    if (nodes.length <= 1) return;
+                    
+                    // 计算每个节点的 barycenter（邻居平均位置）
+                    const scores = nodes.map(node => {
+                        let sum = 0, count = 0;
+                        edges.forEach(e => {
+                            let neighborId = null;
+                            if (e.source === node.id) neighborId = e.target;
+                            else if (e.target === node.id) neighborId = e.source;
+                            
+                            if (neighborId !== null) {
+                                const loc = getNodeDayIndex(neighborId);
+                                if (loc && loc.date !== date) {
+                                    sum += loc.index;
+                                    count++;
+                                }
+                            }
+                        });
+                        return count > 0 ? sum / count : node._pos;
+                    });
+                    
+                    // 按 barycenter 排序
+                    const indexed = nodes.map((n, i) => ({ node: n, score: scores[i], orig: i }));
+                    indexed.sort((a, b) => a.score - b.score);
+                    dayNodes[date] = indexed.map((x, i) => ({ ...x.node, _pos: i }));
+                });
+            }
+            
+            // 写回 dayGroups
+            const result = {};
+            dates.forEach(d => {
+                result[d] = dayNodes[d];
+            });
+            return result;
+        }
+        
+        function renderTimeline() {
+            const container = document.getElementById('container');
+            
+            // 用 barycenter 优化布局
+            const optimized = optimizeLayout(graphData.dayGroups, graphData.edges);
+            
+            // 按日期升序（从早到晚 = 从左到右）
+            const dates = Object.keys(optimized).sort();
+            
+            let html = '<div class="timeline">';
+            
+            dates.forEach(date => {
+                const news = optimized[date];
+                const weekday = new Date(date).toLocaleDateString('zh-CN', { weekday: 'short' });
+                const dateStr = date.substring(5); // MM-DD
+                
+                html += `
+                    <div class="day-column" data-date="${date}">
+                        <div class="date-label">
+                            ${dateStr}
+                            <div class="weekday">${weekday}</div>
+                        </div>
+                        <div class="news-col">
+                `;
+                
+                news.forEach(n => {
+                    const feedName = feedMap[n.feed_id] || 'RSS';
+                    html += `
+                        <div class="news-card" data-id="${n.id}" onclick="showNodeInfo(${n.id})">
+                            <div class="title">${escapeHtml(n.title)}</div>
+                            <div class="meta">
+                                <span class="feed-badge">${feedName}</span>
+                                <span>ID:${n.id}</span>
+                            </div>
+                        </div>
+                    `;
+                });
+                
+                html += '</div></div>';
+            });
+            
+            html += '</div>';
+            container.innerHTML = html;
+            
+            // 双重 requestAnimationFrame 确保浏览器完成布局计算后再绘制连线
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => drawEdges());
+            });
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function drawEdges() {
+            const timeline = document.querySelector('.timeline');
+            if (!timeline) return;
+            
+            let svg = timeline.querySelector('.edges-svg');
+            if (svg) svg.remove();
+            
+            // 显式设置 SVG 尺寸为内容实际尺寸，避免 CSS 百分比计算偏差
+            const w = timeline.scrollWidth;
+            const h = timeline.scrollHeight;
+            
+            svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            svg.classList.add('edges-svg');
+            svg.setAttribute('width', w || timeline.getBoundingClientRect().width);
+            svg.setAttribute('height', h || timeline.getBoundingClientRect().height);
+            timeline.appendChild(svg);
+            
+            const timelineRect = timeline.getBoundingClientRect();
+            const edges = graphData.edges;
+            
+            edges.forEach(edge => {
+                const srcCard = document.querySelector(`.news-card[data-id="${edge.source}"]`);
+                const tgtCard = document.querySelector(`.news-card[data-id="${edge.target}"]`);
+                if (!srcCard || !tgtCard) return;
+                
+                const srcRect = srcCard.getBoundingClientRect();
+                const tgtRect = tgtCard.getBoundingClientRect();
+                
+                // 计算相对于 timeline 的坐标
+                const x1 = srcRect.right - timelineRect.left;
+                const y1 = srcRect.top + srcRect.height / 2 - timelineRect.top;
+                const x2 = tgtRect.left - timelineRect.left;
+                const y2 = tgtRect.top + tgtRect.height / 2 - timelineRect.top;
+                
+                // 水平贝塞尔曲线（控制点在中间水平方向）
+                const midX = (x1 + x2) / 2;
+                
+                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                path.setAttribute('d', `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`);
+                path.setAttribute('fill', 'none');
+                path.setAttribute('stroke', '#ffa500');
+                path.setAttribute('stroke-width', Math.max(1, edge.weight * 3));
+                path.setAttribute('stroke-opacity', Math.max(0.2, edge.weight * 0.7));
+                path.setAttribute('data-source', edge.source);
+                path.setAttribute('data-target', edge.target);
+                path.classList.add('edge-line');
+                svg.appendChild(path);
+            });
+        }
+        
+        let resizeTimer;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => drawEdges(), 200);
+        });
+        
+        // 收集 n-hop 内的所有节点和边
+        function getEgoNetwork(centerId, maxDepth = 2) {
+            const nodeSet = new Set([centerId]);
+            const edgeSet = new Set();
+            let currentLayer = new Set([centerId]);
+            
+            for (let depth = 0; depth < maxDepth; depth++) {
+                const nextLayer = new Set();
+                graphData.edges.forEach((e, idx) => {
+                    if (currentLayer.has(e.source) || currentLayer.has(e.target)) {
+                        edgeSet.add(idx);
+                        const other = e.source === centerId || currentLayer.has(e.source) ? e.target : e.source;
+                        // 只添加已加载的节点
+                        if (graphData.nodes[e.source] && graphData.nodes[e.target]) {
+                            nodeSet.add(e.source);
+                            nodeSet.add(e.target);
+                            if (!currentLayer.has(e.source)) nextLayer.add(e.source);
+                            if (!currentLayer.has(e.target)) nextLayer.add(e.target);
+                        }
+                    }
+                });
+                currentLayer = nextLayer;
+            }
+            
+            return { nodes: nodeSet, edges: edgeSet };
+        }
+        
+        function showNodeInfo(nodeId) {
+            const node = graphData.nodes[nodeId];
+            if (!node) return;
+            
+            selectedNode = nodeId;
+            
+            // 获取 2-hop ego network
+            const ego = getEgoNetwork(nodeId, 2);
+            
+            // 高亮卡片
+            document.querySelectorAll('.news-card').forEach(c => {
+                c.classList.remove('selected');
+                if (ego.nodes.has(parseInt(c.dataset.id))) {
+                    c.classList.remove('dimmed');
+                } else {
+                    c.classList.add('dimmed');
+                }
+            });
+            document.querySelector(`.news-card[data-id="${nodeId}"]`)?.classList.add('selected');
+            
+            // 高亮边
+            document.querySelectorAll('.edge-line').forEach((line, idx) => {
+                line.classList.remove('highlight');
+                line.classList.remove('dimmed');
+                if (ego.edges.has(idx)) {
+                    line.classList.add('highlight');
+                } else {
+                    line.classList.add('dimmed');
+                }
+            });
+            
+            const panel = document.getElementById('info-panel');
+            document.getElementById('info-title').textContent = node.title;
+            document.getElementById('info-link').innerHTML = 
+                `<a href="${node.link}" target="_blank">${node.link}</a>`;
+            document.getElementById('info-meta').innerHTML = 
+                `<span>${node.pub_date}</span><span>${feedMap[node.feed_id] || node.feed_id}</span>`;
+            
+            // 找相邻节点（1-hop）
+            const neighbors = [];
+            graphData.edges.forEach(e => {
+                if (e.source === nodeId || e.target === nodeId) {
+                    const neighborId = e.source === nodeId ? e.target : e.source;
+                    const neighbor = graphData.nodes[neighborId];
+                    if (neighbor) {
+                        neighbors.push({
+                            id: neighborId,
+                            title: neighbor.title,
+                            weight: e.weight,
+                            link: neighbor.link,
+                            pub_date: neighbor.pub_date
+                        });
+                    }
+                }
+            });
+            
+            neighbors.sort((a, b) => b.weight - a.weight);
+            
+            let neighborsHtml = '<h4>相关新闻 (' + neighbors.length + ')</h4>';
+            neighbors.slice(0, 10).forEach(n => {
+                neighborsHtml += `
+                    <div class="neighbor-item" onclick="showNodeInfo(${n.id})" style="cursor:pointer">
+                        <div class="weight">相似度: ${(n.weight * 100).toFixed(0)}%</div>
+                        <div>${escapeHtml(n.title.substring(0, 50))}...</div>
+                        <div style="color:#888;font-size:11px">${extractDate(n.pub_date)}</div>
+                    </div>
+                `;
+            });
+            
+            document.getElementById('info-neighbors').innerHTML = neighborsHtml;
+            panel.classList.add('show');
+        }
+        
+        function closePanel() {
+            document.getElementById('info-panel').classList.remove('show');
+            document.querySelectorAll('.news-card').forEach(c => {
+                c.classList.remove('selected');
+                c.classList.remove('dimmed');
+            });
+            document.querySelectorAll('.edge-line').forEach(line => {
+                line.classList.remove('highlight');
+                line.classList.remove('dimmed');
+            });
+            selectedNode = null;
+        }
+        
+        function fitView() {
+            const container = document.querySelector('.timeline-container');
+            if (container) container.scrollTo(0, 0);
+        }
+        
+        loadFeeds();
+    </script>
+</body>
+</html>

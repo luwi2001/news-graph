@@ -1,0 +1,20 @@
+# News Graph 配置
+
+# 数据库
+db_path: "~/services/rsstt/config/db.sqlite3"
+
+# Embedding 模型
+embedding:
+  model_name: "all-MiniLM-L6-v2"  # 轻量快速模型
+  # model_name: "BAAI/bge-large-zh-v1.5"  # 中文模型 (可选)
+
+# 图构建
+graph:
+  window_days: 3  # 向前天数
+  similarity_threshold: 0.7  # 相似度阈值
+
+# 输出
+output:
+  format: "graphml"  # graphml, gexf, gml
+  filepath: "data/output/news_graph.graphml"
+  json_filepath: "data/output/news_graph.json"
