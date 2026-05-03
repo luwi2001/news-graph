@@ -75,7 +75,7 @@ def main():
     parser.add_argument("--skip-embeddings", action="store_true", help="跳过 embedding 生成，从数据库读取已有 embedding（秒级重建边）")
     parser.add_argument("--window-days", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=0.6)
-    parser.add_argument("--max-edges", type=int, default=3)
+    parser.add_argument("--max-edges", type=int, default=5)
     args = parser.parse_args()
     
     rss_db = os.path.expanduser("~/services/rsstt/config/db.sqlite3")
