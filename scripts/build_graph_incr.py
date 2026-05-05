@@ -121,12 +121,9 @@ def main():
     db_conn.commit()
     print(f"    新增 {len(new_entries)} 个节点")
     
-    if args.rebuild:
-        all_entries = entries
-    else:
-        all_entries = entries
+    all_entries = entries
     
-    if not new_entries and not args.rebuild and not args.skip_embeddings:
+    if not new_entries and not args.rebuild:
         print("[*] 没有新节点，退出")
         return
     
@@ -136,61 +133,54 @@ def main():
         max_edges_per_node=args.max_edges
     )
     
-    if args.skip_embeddings:
-        print("[*] 跳过 Embedding 生成，从数据库读取...")
-        rows = db_conn.execute("""
-            SELECT id, pub_date, embedding FROM node WHERE embedding IS NOT NULL
-        """).fetchall()
-        
-        emb_map = {}
-        for row in rows:
-            nid, pub_date_str, emb_blob = row
-            if emb_blob:
-                emb_map[nid] = pickle.loads(emb_blob)
-        
-        # 如果有新节点缺少 embedding，自动补生成
-        new_entries_missing_emb = [e for e in all_entries if e.id not in emb_map]
-        if new_entries_missing_emb:
-            print(f"    {len(new_entries_missing_emb)} 个新节点需要生成 embedding...")
+    # 统一增量逻辑：从数据库读取已有 embedding，仅对缺失的生成
+    print("[*] 加载已有 Embedding...")
+    rows = db_conn.execute("""
+        SELECT id, embedding FROM node WHERE embedding IS NOT NULL
+    """).fetchall()
+    
+    emb_map = {}
+    for row in rows:
+        nid, emb_blob = row
+        if emb_blob:
+            emb_map[nid] = pickle.loads(emb_blob)
+    
+    # 找出所有缺少 embedding 的节点
+    missing_entries = [e for e in all_entries if e.id not in emb_map]
+    
+    if missing_entries:
+        if args.skip_embeddings:
+            print(f"[!] {len(missing_entries)} 个节点缺少 embedding，但 --skip-embeddings 已指定，无法生成")
+        else:
+            print(f"[*] {len(missing_entries)} 个节点需要生成 embedding...")
             encoder = EmbeddingEncoder(cache_dir="data/embeddings")
-            texts = [encoder.get_text_for_entry(e.title, e.description) for e in new_entries_missing_emb]
+            texts = [encoder.get_text_for_entry(e.title, e.description) for e in missing_entries]
             new_embeddings = encoder.encode(texts)
-            for i, e in enumerate(new_entries_missing_emb):
-                db_conn.execute("UPDATE node SET embedding = ? WHERE id = ?", 
+            for i, e in enumerate(missing_entries):
+                db_conn.execute("UPDATE node SET embedding = ? WHERE id = ?",
                                (pickle.dumps(new_embeddings[i]), e.id))
             db_conn.commit()
-            for i, e in enumerate(new_entries_missing_emb):
+            for i, e in enumerate(missing_entries):
                 emb_map[e.id] = new_embeddings[i]
             print(f"    生成了 {len(new_embeddings)} 个新向量")
-        
-        # 筛选有 embedding 的条目
-        entries_with_emb = []
-        embeddings_list = []
-        for e in all_entries:
-            if e.id in emb_map:
-                entries_with_emb.append(e)
-                embeddings_list.append(emb_map[e.id])
-        
-        missing = len(all_entries) - len(entries_with_emb)
-        if missing > 0:
-            print(f"    警告: {missing} 个节点缺少 embedding，将被跳过")
-        
-        all_entries = entries_with_emb
-        embeddings = np.array(embeddings_list)
-        print(f"    共 {len(embeddings)} 个向量可用")
     else:
-        print("[*] 生成 Embedding...")
-        encoder = EmbeddingEncoder(cache_dir="data/embeddings")
-        
-        texts = [encoder.get_text_for_entry(e.title, e.description) for e in all_entries]
-        embeddings = encoder.encode(texts)
-        
-        for i, e in enumerate(all_entries):
-            db_conn.execute("UPDATE node SET embedding = ? WHERE id = ?", 
-                           (pickle.dumps(embeddings[i]), e.id))
-        
-        db_conn.commit()
-        print(f"    生成了 {len(embeddings)} 个向量")
+        print("    所有节点已有 embedding")
+    
+    # 筛选有 embedding 的条目
+    entries_with_emb = []
+    embeddings_list = []
+    for e in all_entries:
+        if e.id in emb_map:
+            entries_with_emb.append(e)
+            embeddings_list.append(emb_map[e.id])
+    
+    missing = len(all_entries) - len(entries_with_emb)
+    if missing > 0:
+        print(f"    警告: {missing} 个节点缺少 embedding，将被跳过")
+    
+    all_entries = entries_with_emb
+    embeddings = np.array(embeddings_list)
+    print(f"    共 {len(embeddings)} 个向量可用")
     
     if len(all_entries) == 0:
         print("[!] 没有可用节点，退出")
