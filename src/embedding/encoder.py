@@ -35,6 +35,24 @@ class EmbeddingEncoder:
             return f"{title}: {description[:500]}"  # 截取部分内容避免过长
         return title
 
+    def encode_chunks(self, chunks: list[str], show_progress: bool = False, batch_size: int = 128) -> np.ndarray:
+        """批量编码文本段落"""
+        if not chunks:
+            return np.array([])
+        return self.model.encode(chunks, show_progress_bar=show_progress, batch_size=batch_size)
+
+    @staticmethod
+    def get_doc_representative(chunk_embeddings: np.ndarray) -> np.ndarray:
+        """
+        将 chunk 向量聚合为文档代表向量（mean pooling）。
+        如果只有一个 chunk，直接返回。
+        """
+        if len(chunk_embeddings) == 0:
+            raise ValueError("chunk_embeddings is empty")
+        if len(chunk_embeddings) == 1:
+            return chunk_embeddings[0]
+        return np.mean(chunk_embeddings, axis=0)
+
     def save_embeddings(self, embeddings: np.ndarray, filepath: str):
         """保存 embeddings 到缓存"""
         filepath = os.path.join(self.cache_dir, filepath)

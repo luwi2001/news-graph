@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-增量构建新闻图谱到数据库
+增量构建新闻图谱到数据库（知识库版）
+支持 chunk 切分、Faiss 向量索引、实体关系抽取
 """
 import argparse
 import os
@@ -15,8 +16,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from src.utils.db import load_entries, get_connection as get_rss_connection
 from src.embedding.encoder import EmbeddingEncoder
-from src.graph.builder import NewsGraphBuilder, GraphConfig, IncrementalGraphBuilder
-from src.graph.builder import compute_cosine_similarity, compute_days_diff, is_same_day
+from src.graph.builder import GraphConfig
+from src.chunking.chunker import TextChunker
+from src.vectorstore.faiss_store import FaissChunkStore
+from src.knowledge.entity_extractor import EntityExtractor
 
 
 def init_graph_db(db_path):
@@ -64,15 +67,117 @@ def init_graph_db(db_path):
             UNIQUE(source_id, target_id, feed_id)
         )
     """)
-    
+
+    # --- 知识库新增表 ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunk (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            faiss_id INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(doc_id, chunk_index)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS entity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            mention_count INTEGER DEFAULT 1,
+            UNIQUE(name, type)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS entity_mention (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id INTEGER NOT NULL,
+            doc_id INTEGER NOT NULL,
+            chunk_id INTEGER,
+            start_pos INTEGER,
+            end_pos INTEGER,
+            text_span TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS entity_relation (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_entity_id INTEGER NOT NULL,
+            target_entity_id INTEGER NOT NULL,
+            relation_type TEXT DEFAULT 'cooccurrence',
+            doc_id INTEGER NOT NULL,
+            chunk_id INTEGER,
+            confidence REAL DEFAULT 1.0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(source_entity_id, target_entity_id, doc_id, chunk_id)
+        )
+    """)
+    # --- 知识库新增表结束 ---
+
     conn.commit()
     return conn
 
 
+def process_entities(entry, db_conn, extractor):
+    """抽取并存储实体和共现关系（如果该文档尚未处理）"""
+    existing = db_conn.execute(
+        "SELECT COUNT(*) FROM entity_mention WHERE doc_id = ?",
+        (entry.id,)
+    ).fetchone()[0]
+    if existing > 0:
+        return  # 已有实体，跳过
+
+    full_text = entry.title
+    if entry.description:
+        full_text = f"{full_text}: {entry.description}"
+
+    entities, relations = extractor.extract(full_text, entry.id)
+
+    # 存储实体和提及
+    for ent in entities:
+        db_conn.execute("""
+            INSERT OR IGNORE INTO entity (name, type) VALUES (?, ?)
+        """, (ent["name"], ent["type"]))
+
+        cursor = db_conn.execute("""
+            SELECT id FROM entity WHERE name = ? AND type = ?
+        """, (ent["name"], ent["type"]))
+        entity_id = cursor.fetchone()[0]
+
+        db_conn.execute("""
+            INSERT INTO entity_mention (entity_id, doc_id, start_pos, end_pos, text_span)
+            VALUES (?, ?, ?, ?, ?)
+        """, (entity_id, entry.id, ent["start"], ent["end"], ent["text_span"]))
+
+    # 存储关系
+    for rel in relations:
+        src = db_conn.execute(
+            "SELECT id FROM entity WHERE name = ? AND type = ?",
+            (rel["source"], rel["source_type"])
+        ).fetchone()
+        tgt = db_conn.execute(
+            "SELECT id FROM entity WHERE name = ? AND type = ?",
+            (rel["target"], rel["target_type"])
+        ).fetchone()
+        if src and tgt:
+            db_conn.execute("""
+                INSERT OR IGNORE INTO entity_relation
+                (source_entity_id, target_entity_id, relation_type, doc_id, confidence)
+                VALUES (?, ?, ?, ?, ?)
+            """, (src[0], tgt[0], rel["type"], entry.id, rel["confidence"]))
+
+    db_conn.commit()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="增量构建新闻图谱到数据库")
-    parser.add_argument("--rebuild", action="store_true", help="全量重建（删边、重置 in_graph）")
-    parser.add_argument("--skip-embeddings", action="store_true", help="跳过 embedding 生成，从数据库读取已有 embedding（秒级重建边）")
+    parser = argparse.ArgumentParser(description="增量构建新闻图谱到数据库（知识库版）")
+    parser.add_argument("--rebuild", action="store_true", help="全量重建（删边、重置 in_graph、清空 chunks/entities/Faiss）")
+    parser.add_argument("--skip-embeddings", action="store_true", help="跳过 embedding 生成，仅复用已有 chunks/Faiss（秒级重建边）")
+    parser.add_argument("--skip-entities", action="store_true", help="跳过实体关系抽取")
     parser.add_argument("--window-days", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=0.6)
     parser.add_argument("--max-edges", type=int, default=5)
@@ -87,7 +192,7 @@ def main():
     print(f"[*] 图数据库: {graph_db}")
     db_conn = init_graph_db(graph_db)
     
-    # 给已有 edge 表添加 feed_id 列（兼容旧数据库）
+    # 兼容旧数据库：给 edge 表添加 feed_id
     try:
         db_conn.execute("ALTER TABLE edge ADD COLUMN feed_id INTEGER")
         db_conn.commit()
@@ -95,11 +200,21 @@ def main():
     except:
         pass
     
+    # 初始化知识库组件
+    chunker = TextChunker(chunk_size=512, overlap=64)
+    faiss_store = FaissChunkStore(index_path="data/faiss/chunk_index", dim=384)
+    extractor = EntityExtractor()
+    
     if args.rebuild:
         print("    [+] 全量重建模式")
         db_conn.execute("DELETE FROM edge")
         db_conn.execute("UPDATE node SET in_graph = 0")
+        db_conn.execute("DELETE FROM chunk")
+        db_conn.execute("DELETE FROM entity_mention")
+        db_conn.execute("DELETE FROM entity_relation")
+        db_conn.execute("DELETE FROM entity")
         db_conn.commit()
+        faiss_store.clear()
     
     print("[*] 加载 RSS 数据...")
     entries = load_entries(rss_conn)
@@ -133,69 +248,122 @@ def main():
         max_edges_per_node=args.max_edges
     )
     
-    # 统一增量逻辑：从数据库读取已有 embedding，仅对缺失的生成
-    print("[*] 加载已有 Embedding...")
-    rows = db_conn.execute("""
-        SELECT id, embedding FROM node WHERE embedding IS NOT NULL
-    """).fetchall()
+    # --- 阶段 1：区分已有 chunks 和需要新 chunks 的文档 ---
+    print("[*] 分析文档 chunks 状态...")
+    entries_with_chunks = []   # 已有 chunks，可从 Faiss 复用
+    entries_need_chunks = []   # 需要生成新 chunks
     
-    emb_map = {}
-    for row in rows:
-        nid, emb_blob = row
-        if emb_blob:
-            emb_map[nid] = pickle.loads(emb_blob)
-    
-    # 找出所有缺少 embedding 的节点
-    missing_entries = [e for e in all_entries if e.id not in emb_map]
-    
-    if missing_entries:
-        if args.skip_embeddings:
-            print(f"[!] {len(missing_entries)} 个节点缺少 embedding，但 --skip-embeddings 已指定，无法生成")
-        else:
-            print(f"[*] {len(missing_entries)} 个节点需要生成 embedding...")
-            encoder = EmbeddingEncoder(cache_dir="data/embeddings")
-            texts = [encoder.get_text_for_entry(e.title, e.description) for e in missing_entries]
-            new_embeddings = encoder.encode(texts)
-            for i, e in enumerate(missing_entries):
-                db_conn.execute("UPDATE node SET embedding = ? WHERE id = ?",
-                               (pickle.dumps(new_embeddings[i]), e.id))
-            db_conn.commit()
-            for i, e in enumerate(missing_entries):
-                emb_map[e.id] = new_embeddings[i]
-            print(f"    生成了 {len(new_embeddings)} 个新向量")
-    else:
-        print("    所有节点已有 embedding")
-    
-    # 筛选有 embedding 的条目
-    entries_with_emb = []
-    embeddings_list = []
     for e in all_entries:
-        if e.id in emb_map:
-            entries_with_emb.append(e)
-            embeddings_list.append(emb_map[e.id])
+        rows = db_conn.execute(
+            "SELECT text, chunk_index, faiss_id FROM chunk WHERE doc_id = ? ORDER BY chunk_index",
+            (e.id,)
+        ).fetchall()
+        if rows:
+            entries_with_chunks.append((e, rows))
+        else:
+            entries_need_chunks.append(e)
     
-    missing = len(all_entries) - len(entries_with_emb)
-    if missing > 0:
-        print(f"    警告: {missing} 个节点缺少 embedding，将被跳过")
+    print(f"    {len(entries_with_chunks)} 篇已有 chunks，{len(entries_need_chunks)} 篇需要生成")
     
-    all_entries = entries_with_emb
-    embeddings = np.array(embeddings_list)
-    print(f"    共 {len(embeddings)} 个向量可用")
+    if args.skip_embeddings and entries_need_chunks:
+        print(f"[!] {len(entries_need_chunks)} 篇缺少 chunks，但 --skip-embeddings 已指定，将跳过")
     
-    if len(all_entries) == 0:
+    # --- 阶段 2：批量生成新 chunks 的 embeddings ---
+    doc_embeddings_map = {}
+    
+    if entries_need_chunks and not args.skip_embeddings:
+        print("[*] 生成新 chunks...")
+        # 先为所有需要处理的文档生成 chunks 文本
+        all_new_chunks_texts = []
+        doc_chunk_counts = []  # 记录每篇文档有多少个 chunks
+        
+        for e in entries_need_chunks:
+            chunks = chunker.chunk(e.title, e.description)
+            doc_chunk_counts.append(len(chunks))
+            all_new_chunks_texts.extend(chunks)
+        
+        print(f"    共 {len(all_new_chunks_texts)} 个新 chunks，开始批量编码...")
+        encoder = EmbeddingEncoder(cache_dir="data/embeddings")
+        all_new_embeddings = encoder.encode_chunks(all_new_chunks_texts, show_progress=True)
+        print(f"    编码完成")
+        
+        # 按文档切分 embeddings，写入 Faiss 和 chunk 表
+        offset = 0
+        for e, count in zip(entries_need_chunks, doc_chunk_counts):
+            chunk_embeddings = all_new_embeddings[offset:offset + count]
+            chunks_texts = all_new_chunks_texts[offset:offset + count]
+            offset += count
+            
+            # 添加到 Faiss
+            metadata = [{"doc_id": e.id, "text": t} for t in chunks_texts]
+            faiss_ids = faiss_store.add_chunks(chunk_embeddings, metadata)
+            
+            # 写入 chunk 表
+            for idx, (chunk_text, fid) in enumerate(zip(chunks_texts, faiss_ids)):
+                db_conn.execute("""
+                    INSERT OR REPLACE INTO chunk (doc_id, text, chunk_index, faiss_id)
+                    VALUES (?, ?, ?, ?)
+                """, (e.id, chunk_text, idx, fid))
+            
+            # 计算文档代表向量
+            doc_emb = EmbeddingEncoder.get_doc_representative(chunk_embeddings)
+            doc_embeddings_map[e.id] = doc_emb
+        
+        db_conn.commit()
+        print(f"    已写入 {len(entries_need_chunks)} 篇文档的 chunks")
+    
+    # --- 阶段 3：从 Faiss 复用已有 chunks 的文档向量 ---
+    if entries_with_chunks:
+        print(f"[*] 从 Faiss 复用 {len(entries_with_chunks)} 篇已有 chunks...")
+        for e, rows in entries_with_chunks:
+            chunk_embeddings = []
+            for text, idx, fid in rows:
+                if fid is not None and 0 <= fid < faiss_store.index.ntotal:
+                    vec = faiss_store.index.reconstruct(int(fid))
+                    chunk_embeddings.append(vec)
+                else:
+                    # Faiss ID 无效，重新编码这个 chunk
+                    if args.skip_embeddings:
+                        break
+                    encoder = encoder if 'encoder' in dir() else EmbeddingEncoder(cache_dir="data/embeddings")
+                    vec = encoder.encode_chunks([text])[0]
+                    chunk_embeddings.append(vec)
+            
+            if len(chunk_embeddings) > 0:
+                doc_emb = EmbeddingEncoder.get_doc_representative(np.array(chunk_embeddings))
+                doc_embeddings_map[e.id] = doc_emb
+    
+    skipped = len(all_entries) - len(doc_embeddings_map)
+    if skipped > 0:
+        print(f"    警告: {skipped} 个节点缺少 embedding，将被跳过")
+    
+    print(f"    共 {len(doc_embeddings_map)} 个文档向量可用")
+    
+    # --- 阶段 4：实体抽取 ---
+    if not args.skip_entities:
+        print("[*] 抽取实体关系...")
+        for i, e in enumerate(all_entries):
+            if e.id in doc_embeddings_map:
+                process_entities(e, db_conn, extractor)
+            if (i + 1) % 200 == 0:
+                print(f"    已处理 {i + 1}/{len(all_entries)} 篇")
+        
+        entity_count = db_conn.execute("SELECT COUNT(*) FROM entity").fetchone()[0]
+        relation_count = db_conn.execute("SELECT COUNT(*) FROM entity_relation").fetchone()[0]
+        print(f"    共 {entity_count} 个实体, {relation_count} 条关系")
+    
+    # --- 阶段 5：按 feed 分组构建边 ---
+    entries_with_emb = [e for e in all_entries if e.id in doc_embeddings_map]
+    if len(entries_with_emb) == 0:
         print("[!] 没有可用节点，退出")
         return
-    
-    # 建立 id -> embedding 映射
-    id_to_emb = {e.id: embeddings[i] for i, e in enumerate(all_entries)}
     
     print("[*] 按 RSS 源分组构建边...")
     from collections import defaultdict
     from src.graph.builder import build_edges as build_edge_func
     
-    # 按 feed_id 分组
     feed_groups = defaultdict(list)
-    for e in all_entries:
+    for e in entries_with_emb:
         feed_groups[e.feed_id].append(e)
     
     total_edges = 0
@@ -204,11 +372,10 @@ def main():
         if len(feed_entries) < 2:
             continue
         
-        # 按时间升序排列
         sorted_feed = sorted(feed_entries, key=lambda e: e.pub_date)
         pub_dates = [e.pub_date for e in sorted_feed]
         entry_ids = [e.id for e in sorted_feed]
-        embs = np.array([id_to_emb[eid] for eid in entry_ids])
+        embs = np.array([doc_embeddings_map[eid] for eid in entry_ids])
         
         edges = build_edge_func(embs, pub_dates, config)
         total_edges += len(edges)
@@ -221,15 +388,20 @@ def main():
     
     print(f"    共 {total_edges} 条边（{len(feed_groups)} 个 feed）")
     
-    for entry_id in [e.id for e in all_entries]:
-        db_conn.execute("UPDATE node SET in_graph = 1 WHERE id = ?", (entry_id,))
+    # 更新向后兼容的 node.embedding BLOB
+    for e in entries_with_emb:
+        db_conn.execute("""
+            UPDATE node SET embedding = ? WHERE id = ?
+        """, (pickle.dumps(doc_embeddings_map[e.id]), e.id))
+        db_conn.execute("UPDATE node SET in_graph = 1 WHERE id = ?", (e.id,))
     
     db_conn.commit()
     
     node_count = db_conn.execute("SELECT COUNT(*) FROM node WHERE in_graph = 1").fetchone()[0]
     edge_count = db_conn.execute("SELECT COUNT(*) FROM edge").fetchone()[0]
+    chunk_count = db_conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]
     
-    print(f"[*] 统计: {node_count} 节点, {edge_count} 边")
+    print(f"[*] 统计: {node_count} 节点, {edge_count} 边, {chunk_count} chunks")
     
     print("[*] 导出 JSON...")
     nodes = []
@@ -241,7 +413,6 @@ def main():
     cursor = db_conn.execute("SELECT source_id, target_id, weight, feed_id FROM edge ORDER BY source_id")
     for row in cursor:
         w = row[2]
-        # 兼容旧数据：np.float32 曾被错误存为 BLOB
         if isinstance(w, bytes):
             import struct
             w = struct.unpack("f", w)[0]
@@ -253,6 +424,7 @@ def main():
         "max_edges": args.max_edges,
         "nodeCount": node_count,
         "edgeCount": edge_count,
+        "chunkCount": chunk_count,
         "nodes": nodes,
         "edges": edges,
         "exportedAt": datetime.now().isoformat()

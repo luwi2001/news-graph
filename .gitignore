@@ -41,6 +41,7 @@ Thumbs.db
 # Project data (generated files)
 data/news_graph.db
 data/embeddings/
+data/faiss/
 data/output/*.json
 data/output/*.png
 data/output/*.graphml
