@@ -131,9 +131,24 @@ def process_entities(entry, db_conn, extractor):
     if existing > 0:
         return  # 已有实体，跳过
 
-    full_text = entry.title
-    if entry.description:
-        full_text = f"{full_text}: {entry.description}"
+    # HTML 清洗（P0）
+    title = entry.title.strip() if entry.title else ""
+    description = entry.description or ""
+    if description:
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(description, 'html.parser')
+            for tag in soup(['img', 'figure', 'figcaption', 'script', 'style', 'iframe']):
+                tag.decompose()
+            description = soup.get_text(separator=' ', strip=True)
+        except ImportError:
+            import re
+            description = re.sub(r'<[^>]+>', ' ', description)
+            description = re.sub(r'\s+', ' ', description).strip()
+
+    full_text = title
+    if description:
+        full_text = f"{full_text}: {description}"
 
     entities, relations = extractor.extract(full_text, entry.id)
 

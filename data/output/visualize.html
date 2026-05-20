@@ -343,6 +343,19 @@
                 <div class="link" id="info-link"></div>
                 <div class="meta" id="info-meta"></div>
                 <div class="neighbors" id="info-neighbors"></div>
+                <div id="summary-section" style="margin-top: 20px; border-top: 1px solid #eee; padding-top: 15px;">
+                    <button id="summary-btn" onclick="generateSummary()" style="width: 100%; padding: 10px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px;">
+                        🧠 生成解读
+                    </button>
+                    <div id="summary-loading" style="display:none; text-align:center; padding:20px; color:#888;">
+                        <div style="font-size:24px; margin-bottom:8px;">⏳</div>
+                        <div style="font-size:12px;">正在阅读新闻并生成解读...</div>
+                    </div>
+                    <div id="summary-result" style="display:none; margin-top: 15px;">
+                        <h4 style="font-size: 14px; color: #333; margin-bottom: 10px;">📋 事件解读</h4>
+                        <div id="summary-content" style="font-size: 12px; line-height: 1.8; color: #444; background: #f8f9fa; padding: 12px; border-radius: 6px; max-height: 400px; overflow-y: auto;"></div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -637,19 +650,26 @@
             for (let depth = 0; depth < maxDepth; depth++) {
                 const nextLayer = new Set();
                 graphData.edges.forEach((e, idx) => {
-                    if (currentLayer.has(e.source) || currentLayer.has(e.target)) {
-                        edgeSet.add(idx);
-                        const other = e.source === centerId || currentLayer.has(e.source) ? e.target : e.source;
-                        // 只添加已加载的节点
-                        if (graphData.nodes[e.source] && graphData.nodes[e.target]) {
-                            nodeSet.add(e.source);
-                            nodeSet.add(e.target);
-                            if (!currentLayer.has(e.source)) nextLayer.add(e.source);
-                            if (!currentLayer.has(e.target)) nextLayer.add(e.target);
-                        }
+                    // 只处理与当前层节点相连的边
+                    const sourceInLayer = currentLayer.has(e.source);
+                    const targetInLayer = currentLayer.has(e.target);
+                    if (!sourceInLayer && !targetInLayer) return;
+                    
+                    edgeSet.add(idx);
+                    
+                    // 只把**不在已发现集合中**的新节点加入下一层
+                    if (!nodeSet.has(e.source)) {
+                        nodeSet.add(e.source);
+                        nextLayer.add(e.source);
+                    }
+                    if (!nodeSet.has(e.target)) {
+                        nodeSet.add(e.target);
+                        nextLayer.add(e.target);
                     }
                 });
                 currentLayer = nextLayer;
+                // 如果下一层为空，提前结束
+                if (nextLayer.size === 0) break;
             }
             
             return { nodes: nodeSet, edges: edgeSet };
@@ -741,6 +761,10 @@
                 line.classList.remove('dimmed');
             });
             selectedNode = null;
+            // 重置总结区域
+            document.getElementById('summary-result').style.display = 'none';
+            document.getElementById('summary-btn').style.display = 'block';
+            document.getElementById('summary-content').innerHTML = '';
         }
         
         function fitView() {
@@ -782,6 +806,172 @@
         }
         window.addEventListener('load', adjustPanelPosition);
         window.addEventListener('resize', adjustPanelPosition);
+        
+        // ===== 生成解读功能 =====
+        async function generateSummary() {
+            if (!selectedNode) return;
+            
+            const ego = getEgoNetwork(selectedNode, 2);
+            const nodeIds = Array.from(ego.nodes);
+            
+            if (nodeIds.length <= 1) {
+                alert('当前选中新闻没有相关新闻，无法生成解读');
+                return;
+            }
+            
+            // UI 状态
+            document.getElementById('summary-btn').style.display = 'none';
+            document.getElementById('summary-loading').style.display = 'block';
+            document.getElementById('summary-result').style.display = 'none';
+            
+            try {
+                const res = await fetch('/api/summarize', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ node_ids: nodeIds })
+                });
+                
+                let data;
+                const contentType = res.headers.get('content-type') || '';
+                
+                if (!res.ok) {
+                    // 后端返回了 HTTP 错误状态
+                    const text = await res.text();
+                    throw new Error(`HTTP ${res.status}: ${text.substring(0, 200)}`);
+                }
+                
+                if (!contentType.includes('application/json')) {
+                    // 返回的不是 JSON，可能是 HTML 错误页面
+                    const text = await res.text();
+                    throw new Error(`返回格式错误 (${contentType}): ${text.substring(0, 200)}`);
+                }
+                
+                data = await res.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                
+                document.getElementById('summary-loading').style.display = 'none';
+                
+                if (data.success) {
+                    // AI 解读成功返回
+                    let html = data.summary
+                        .replace(/^### (.*$)/gim, '<h5 style="margin:12px 0 6px 0;color:#333;font-size:13px;">$1</h5>')
+                        .replace(/^## (.*$)/gim, '<h4 style="margin:15px 0 8px 0;color:#222;font-size:14px;border-bottom:1px solid #eee;padding-bottom:4px;">$1</h4>')
+                        .replace(/^# (.*$)/gim, '<h3 style="margin:18px 0 10px 0;color:#1a1a2e;font-size:16px;">$1</h3>')
+                        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                        .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                        .replace(/`([^`]+)`/g, '<code style="background:#e8e8e8;padding:1px 4px;border-radius:3px;font-size:11px;">$1</code>')
+                        .replace(/\n/g, '<br>');
+                    
+                    const costStr = data.cost ? `花费 $${data.cost.toFixed(6)}` : '';
+                    const tokenStr = (data.prompt_tokens && data.completion_tokens) 
+                        ? `(${data.prompt_tokens}+${data.completion_tokens} tokens)` : '';
+                    
+                    document.getElementById('summary-content').innerHTML = `
+<div style="background:#d4edda;border:1px solid #c3e6cb;padding:10px;border-radius:6px;margin-bottom:12px;font-size:12px;color:#155724;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+    <div>✅ <strong>${escapeHtml(data.model)}</strong> 分析 <strong>${data.node_count}</strong> 篇新闻</div>
+    <div style="font-size:11px;opacity:0.8;">${costStr} ${tokenStr}</div>
+</div>
+<button onclick="downloadReport()" style="padding:6px 12px;background:#28a745;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px;margin-bottom:12px;">
+    ⬇️ 下载 Markdown 报告
+</button>
+<div style="font-size:12px;line-height:1.8;color:#444;background:#f8f9fa;padding:12px;border-radius:6px;max-height:400px;overflow-y:auto;">
+    ${html}
+</div>`;
+                    
+                    // 保存数据供下载使用
+                    window._lastSummaryData = {
+                        model: data.model,
+                        node_count: data.node_count,
+                        summary: data.summary,
+                        cost: data.cost,
+                        prompt_tokens: data.prompt_tokens,
+                        completion_tokens: data.completion_tokens,
+                        timestamp: new Date().toLocaleString('zh-CN')
+                    };
+                } else if (data.fallback) {
+                    // AI 不可用，展示 fallback 模式
+                    let fallbackHtml = `
+<div style="background:#fff3cd;border:1px solid #ffeaa7;padding:12px;border-radius:6px;margin-bottom:15px;">
+    <div style="font-size:13px;color:#856404;margin-bottom:8px;">⚠️ AI 服务暂时不可用</div>
+    <div style="font-size:12px;color:#856404;">原因: ${escapeHtml(data.error)}</div>
+</div>
+<div style="font-size:12px;color:#666;margin-bottom:8px;">已为你整理好 ${data.node_count} 篇新闻的分析材料，可以一键复制发送给 Xub 解读：</div>
+<button onclick="copyPrompt()" style="width:100%;padding:10px;background:#4a90d9;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px;margin-bottom:12px;">
+    📋 复制分析请求
+</button>
+<div id="prompt-text" style="display:none;">${escapeHtml(data.prompt)}</div>
+<div style="font-size:11px;color:#888;">提示: 复制后到 Telegram 粘贴发送给 Xub，他会实时为你解读</div>
+                    `;
+                    document.getElementById('summary-content').innerHTML = fallbackHtml;
+                } else {
+                    document.getElementById('summary-content').innerHTML = 
+                        `<div style="color: #c00;">未知响应: ${escapeHtml(JSON.stringify(data))}</div>`;
+                }
+                
+                document.getElementById('summary-result').style.display = 'block';
+                
+            } catch (e) {
+                document.getElementById('summary-loading').style.display = 'none';
+                document.getElementById('summary-content').innerHTML = 
+                    `<div style="color: #c00;">请求失败: ${escapeHtml(e.message)}</div>`;
+                document.getElementById('summary-result').style.display = 'block';
+            }
+        }
+        
+        function downloadReport() {
+            const d = window._lastSummaryData;
+            if (!d) {
+                alert('没有可下载的报告，请先生成解读');
+                return;
+            }
+            
+            const costInfo = d.cost ? `**调用成本**: $${d.cost.toFixed(6)} (${d.prompt_tokens}+${d.completion_tokens} tokens)` : '';
+            
+            const md = `# 📰 新闻图谱事件解读报告
+
+**生成时间**: ${d.timestamp}  
+**分析模型**: ${escapeHtml(d.model)}  
+**新闻数量**: ${d.node_count} 篇  
+${costInfo}
+---
+
+${d.summary}
+
+---
+
+*本报告由 NewsGraph AI 自动生成*
+`;
+            
+            const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const dateStr = new Date().toISOString().slice(0, 10);
+            a.href = url;
+            a.download = `新闻解读_${dateStr}.md`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        
+        function copyPrompt() {
+            const promptText = document.getElementById('prompt-text').textContent;
+            navigator.clipboard.writeText(promptText).then(() => {
+                const btn = document.querySelector('#summary-content button');
+                const originalText = btn.textContent;
+                btn.textContent = '✅ 已复制!';
+                btn.style.background = '#28a745';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.background = '#4a90d9';
+                }, 2000);
+            }).catch(err => {
+                alert('复制失败，请手动复制: ' + err);
+            });
+        }
         
         loadFeeds();
     </script>
