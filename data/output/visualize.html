@@ -316,8 +316,15 @@
         <label>阈值 ≥ 
             <input type="number" id="min-weight" value="0.7" step="0.05" min="0" max="1" style="width:60px">
         </label>
+        <label>开始日期
+            <input type="date" id="start-date" onchange="loadGraph()">
+        </label>
+        <label>结束日期
+            <input type="date" id="end-date" onchange="loadGraph()">
+        </label>
         <button onclick="loadGraph()">应用</button>
-        <button onclick="fitView()">回到最初日期</button>
+        <button onclick="resetDateRange()">最近14天</button>
+        <button onclick="fitView()">回到最新</button>
     </div>
     
     <div class="main-content">
@@ -410,6 +417,8 @@
         async function loadGraph() {
             const minWeight = parseFloat(document.getElementById('min-weight').value);
             const feedSelect = document.getElementById('feed-select');
+            const startDateInput = document.getElementById('start-date').value;
+            const endDateInput = document.getElementById('end-date').value;
             
             // 获取当前选中的 feed_id（防御性写法）
             let selectedValue = '';
@@ -428,14 +437,33 @@
                 const res = await fetch(url);
                 const data = await res.json();
                 
-                const filteredEdges = data.edges.filter(e => e.weight >= minWeight);
+                // 1. 按日期范围过滤节点
+                let dateFilteredNodes = data.nodes;
+                if (startDateInput || endDateInput) {
+                    dateFilteredNodes = data.nodes.filter(n => {
+                        const date = extractDate(n.pub_date);
+                        if (date === 'unknown') return false;
+                        if (startDateInput && date < startDateInput) return false;
+                        if (endDateInput && date > endDateInput) return false;
+                        return true;
+                    });
+                }
+                
+                // 2. 按 weight 过滤边，且两端点必须在日期范围内
+                const dateNodeIds = new Set(dateFilteredNodes.map(n => n.id));
+                const filteredEdges = data.edges.filter(e => 
+                    e.weight >= minWeight && dateNodeIds.has(e.source) && dateNodeIds.has(e.target)
+                );
+                
+                // 3. 收集有连接的节点
                 const connectedNodes = new Set();
                 filteredEdges.forEach(e => {
                     connectedNodes.add(e.source);
                     connectedNodes.add(e.target);
                 });
                 
-                const nodes = data.nodes.filter(n => connectedNodes.has(n.id));
+                // 4. 最终节点：日期范围内且有连接
+                const nodes = dateFilteredNodes.filter(n => connectedNodes.has(n.id));
                 
                 const dayGroups = {};
                 nodes.forEach(n => {
@@ -576,6 +604,10 @@
                 requestAnimationFrame(() => {
                     drawEdges();
                     updateSliderRange();
+                    // 默认滚动到最右侧（最新内容）
+                    const maxScroll = Math.max(0, timelineContainer.scrollWidth - timelineContainer.clientWidth);
+                    timelineContainer.scrollLeft = maxScroll;
+                    slider.value = maxScroll;
                 });
             });
         }
@@ -771,9 +803,27 @@
         function fitView() {
             const container = document.querySelector('.timeline-container');
             if (container) {
-                container.scrollTo(0, 0);
-                document.getElementById('scroll-slider').value = 0;
+                const maxScroll = Math.max(0, container.scrollWidth - container.clientWidth);
+                container.scrollLeft = maxScroll;
+                document.getElementById('scroll-slider').value = maxScroll;
             }
+        }
+        
+        // 初始化日期范围为最近14天
+        function initDateRange() {
+            const today = new Date();
+            const fourteenDaysAgo = new Date(today);
+            fourteenDaysAgo.setDate(today.getDate() - 14);
+            
+            const formatDate = (d) => d.toISOString().split('T')[0];
+            
+            document.getElementById('end-date').value = formatDate(today);
+            document.getElementById('start-date').value = formatDate(fourteenDaysAgo);
+        }
+        
+        function resetDateRange() {
+            initDateRange();
+            loadGraph();
         }
         
         // Slider 控制 timeline 水平滚动
@@ -974,6 +1024,7 @@ ${d.summary}
             });
         }
         
+        initDateRange();
         loadFeeds();
     </script>
 </body>
