@@ -129,7 +129,7 @@ def process_entities(entry, db_conn, extractor):
         (entry.id,)
     ).fetchone()[0]
     if existing > 0:
-        return  # 已有实体，跳过
+        return 0  # 已有实体，跳过
 
     # HTML 清洗（P0）
     title = entry.title.strip() if entry.title else ""
@@ -150,7 +150,7 @@ def process_entities(entry, db_conn, extractor):
     if description:
         full_text = f"{full_text}: {description}"
 
-    entities, relations = extractor.extract(full_text, entry.id)
+    entities, relations = extractor.extract(full_text, entry.id, feed_id=entry.feed_id)
 
     # 存储实体和提及
     for ent in entities:
@@ -186,6 +186,7 @@ def process_entities(entry, db_conn, extractor):
             """, (src[0], tgt[0], rel["type"], entry.id, rel["confidence"]))
 
     db_conn.commit()
+    return len(entities)
 
 
 def main():
@@ -263,6 +264,19 @@ def main():
         max_edges_per_node=args.max_edges
     )
     
+    # 检查 Faiss 索引状态
+    faiss_total = faiss_store.index.ntotal if faiss_store.index else 0
+    print(f"    Faiss 索引: {faiss_total} 个向量")
+    
+    # 如果 Faiss 为空但 chunk 表有记录，说明索引文件丢失/损坏，需要重建
+    chunk_count = db_conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]
+    if chunk_count > 0 and faiss_total == 0:
+        print(f"[!] 警告: chunk 表有 {chunk_count} 条记录，但 Faiss 索引为空！")
+        print("    可能原因: Faiss 索引文件丢失或损坏")
+        force_rebuild_faiss = True
+    else:
+        force_rebuild_faiss = False
+    
     # --- 阶段 1：区分已有 chunks 和需要新 chunks 的文档 ---
     print("[*] 分析文档 chunks 状态...")
     entries_with_chunks = []   # 已有 chunks，可从 Faiss 复用
@@ -273,12 +287,19 @@ def main():
             "SELECT text, chunk_index, faiss_id FROM chunk WHERE doc_id = ? ORDER BY chunk_index",
             (e.id,)
         ).fetchall()
-        if rows:
+        if rows and not force_rebuild_faiss:
             entries_with_chunks.append((e, rows))
         else:
             entries_need_chunks.append(e)
     
-    print(f"    {len(entries_with_chunks)} 篇已有 chunks，{len(entries_need_chunks)} 篇需要生成")
+    if force_rebuild_faiss:
+        print(f"    强制重建: {len(entries_need_chunks)} 篇需要重新生成 chunks")
+        # 清空 chunk 表，避免旧 faiss_id 干扰
+        db_conn.execute("DELETE FROM chunk")
+        db_conn.commit()
+        print("    已清空 chunk 表")
+    else:
+        print(f"    {len(entries_with_chunks)} 篇已有 chunks，{len(entries_need_chunks)} 篇需要生成")
     
     if args.skip_embeddings and entries_need_chunks:
         print(f"[!] {len(entries_need_chunks)} 篇缺少 chunks，但 --skip-embeddings 已指定，将跳过")
@@ -357,17 +378,53 @@ def main():
     # --- 阶段 4：实体抽取 ---
     if not args.skip_entities:
         print("[*] 抽取实体关系...")
+        processed_count = 0
+        skipped_count = 0
         for i, e in enumerate(all_entries):
             if e.id in doc_embeddings_map:
-                process_entities(e, db_conn, extractor)
+                result = process_entities(e, db_conn, extractor)
+                if result > 0:
+                    processed_count += 1
+                else:
+                    skipped_count += 1
             if (i + 1) % 200 == 0:
-                print(f"    已处理 {i + 1}/{len(all_entries)} 篇")
+                print(f"    已扫描 {i + 1}/{len(all_entries)} 篇（新处理 {processed_count}, 跳过 {skipped_count}）")
         
         entity_count = db_conn.execute("SELECT COUNT(*) FROM entity").fetchone()[0]
         relation_count = db_conn.execute("SELECT COUNT(*) FROM entity_relation").fetchone()[0]
-        print(f"    共 {entity_count} 个实体, {relation_count} 条关系")
+        print(f"    共 {entity_count} 个实体, {relation_count} 条关系（本次新处理 {processed_count} 篇）")
+        
+        # 打印 API 费用报告
+        cost_report = extractor.get_cost_report()
+        if cost_report["calls"] > 0:
+            print(f"    API 调用: {cost_report['calls']} 次, 预估费用: ${cost_report['estimated_cost_usd']:.6f}")
+            if cost_report["errors"] > 0:
+                print(f"    API 失败: {cost_report['errors']} 次（已回退到 GLiNER）")
+            
+            # 写入费用日志
+            log_dir = os.path.join(os.path.dirname(graph_db), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, "ner_cost.log")
+            
+            log_line = (
+                f"[{datetime.now().isoformat()}] "
+                f"new_docs={processed_count} "
+                f"skipped_docs={skipped_count} "
+                f"calls={cost_report['calls']} "
+                f"cost=${cost_report['estimated_cost_usd']:.6f} "
+                f"errors={cost_report['errors']} "
+                f"prompt_tokens={cost_report['prompt_tokens']} "
+                f"completion_tokens={cost_report['completion_tokens']}\n"
+            )
+            
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(log_line)
+            print(f"    费用日志: {log_path}")
     
     # --- 阶段 5：按 feed 分组构建边 ---
+    # 配置：哪些 feed 合并为一个组（key: 被合并的 feed_id, value: 目标 feed_id）
+    FEED_MERGE = {13: 3}  # Reuters World China -> Bloomberg Politics - Asia
+    
     entries_with_emb = [e for e in all_entries if e.id in doc_embeddings_map]
     if len(entries_with_emb) == 0:
         print("[!] 没有可用节点，退出")
@@ -379,8 +436,8 @@ def main():
     
     feed_groups = defaultdict(list)
     for e in entries_with_emb:
-        feed_groups[e.feed_id].append(e)
-    
+        effective_feed_id = FEED_MERGE.get(e.feed_id, e.feed_id)
+        feed_groups[effective_feed_id].append(e)
     total_edges = 0
     
     for feed_id, feed_entries in sorted(feed_groups.items()):

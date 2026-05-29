@@ -24,6 +24,9 @@ from pathlib import Path
 _encoder = None
 _faiss_store = None
 
+# 配置：哪些 feed 合并显示为一个板块
+FEED_MERGE = {13: 3}  # Reuters World China -> Bloomberg Politics - Asia
+
 
 def _get_encoder():
     global _encoder
@@ -423,12 +426,23 @@ class GraphAPIHandler(SimpleHTTPRequestHandler):
         feed_id = self._get_feed_id()
         conn = get_db()
         
+        # 计算需要查询的 feed_id 列表（包含被合并的 feed）
+        if feed_id:
+            target_feed_ids = [feed_id]
+            for src, tgt in FEED_MERGE.items():
+                if tgt == feed_id:
+                    target_feed_ids.append(src)
+            placeholders = ','.join('?' * len(target_feed_ids))
+        else:
+            target_feed_ids = None
+            placeholders = None
+        
         if feed_id:
             nodes = []
-            cursor = conn.execute("""
+            cursor = conn.execute(f"""
                 SELECT id, title, link, pub_date, feed_id 
-                FROM node WHERE in_graph = 1 AND feed_id = ? ORDER BY pub_date DESC
-            """, (feed_id,))
+                FROM node WHERE in_graph = 1 AND feed_id IN ({placeholders}) ORDER BY pub_date DESC
+            """, target_feed_ids)
             for row in cursor:
                 nodes.append({
                     "id": row[0],
@@ -439,9 +453,9 @@ class GraphAPIHandler(SimpleHTTPRequestHandler):
                 })
             
             edges = []
-            cursor = conn.execute("""
-                SELECT source_id, target_id, weight, feed_id FROM edge WHERE feed_id = ?
-            """, (feed_id,))
+            cursor = conn.execute(f"""
+                SELECT source_id, target_id, weight, feed_id FROM edge WHERE feed_id IN ({placeholders})
+            """, target_feed_ids)
             for row in cursor:
                 edges.append({
                     "source": row[0],
@@ -488,10 +502,16 @@ class GraphAPIHandler(SimpleHTTPRequestHandler):
         conn = get_db()
         
         if feed_id:
-            cursor = conn.execute("""
+            # 计算需要查询的 feed_id 列表（包含被合并的 feed）
+            target_feed_ids = [feed_id]
+            for src, tgt in FEED_MERGE.items():
+                if tgt == feed_id:
+                    target_feed_ids.append(src)
+            placeholders = ','.join('?' * len(target_feed_ids))
+            cursor = conn.execute(f"""
                 SELECT id, title, link, pub_date, feed_id 
-                FROM node WHERE in_graph = 1 AND feed_id = ? ORDER BY pub_date DESC
-            """, (feed_id,))
+                FROM node WHERE in_graph = 1 AND feed_id IN ({placeholders}) ORDER BY pub_date DESC
+            """, target_feed_ids)
         else:
             cursor = conn.execute("""
                 SELECT id, title, link, pub_date, feed_id 
@@ -515,9 +535,15 @@ class GraphAPIHandler(SimpleHTTPRequestHandler):
         conn = get_db()
         
         if feed_id:
-            cursor = conn.execute("""
-                SELECT source_id, target_id, weight, feed_id FROM edge WHERE feed_id = ? LIMIT 1000
-            """, (feed_id,))
+            # 计算需要查询的 feed_id 列表（包含被合并的 feed）
+            target_feed_ids = [feed_id]
+            for src, tgt in FEED_MERGE.items():
+                if tgt == feed_id:
+                    target_feed_ids.append(src)
+            placeholders = ','.join('?' * len(target_feed_ids))
+            cursor = conn.execute(f"""
+                SELECT source_id, target_id, weight, feed_id FROM edge WHERE feed_id IN ({placeholders}) LIMIT 1000
+            """, target_feed_ids)
         else:
             cursor = conn.execute("SELECT source_id, target_id, weight, feed_id FROM edge LIMIT 1000")
         
@@ -533,16 +559,27 @@ class GraphAPIHandler(SimpleHTTPRequestHandler):
         return {"edges": edges}
     
     def get_feeds(self):
-        """从 RSS 数据库获取 feed 列表"""
+        """从 RSS 数据库获取 feed 列表，合并配置的 feed"""
         conn = get_rss_db()
         cursor = conn.execute("""
             SELECT id, title, link FROM feed WHERE state = 1 ORDER BY id
         """)
         feeds = []
+        merged_target_ids = set(FEED_MERGE.values())
         for row in cursor:
+            feed_id = row[0]
+            # 被合并的 feed 不单独显示
+            if feed_id in FEED_MERGE:
+                continue
+            # 如果是合并目标，标题加上合并来源
+            title = row[1]
+            if feed_id in merged_target_ids:
+                sources = [f'ID{k}' for k, v in FEED_MERGE.items() if v == feed_id]
+                if sources:
+                    title = f"{title} (含 {', '.join(sources)})"
             feeds.append({
-                "id": row[0],
-                "title": row[1],
+                "id": feed_id,
+                "title": title,
                 "link": row[2]
             })
         conn.close()
