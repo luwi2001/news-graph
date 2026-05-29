@@ -247,7 +247,7 @@ def main():
             db_conn.execute("""
                 INSERT INTO node (id, graph_id, title, link, pub_date, description, feed_id, in_graph)
                 VALUES (?, 1, ?, ?, ?, ?, ?, 0)
-            """, (e.id, e.title, e.link, e.pub_date.isoformat(), e.description, e.feed_id))
+            """, (e.id, e.title, e.link, e.pub_date.strftime('%Y-%m-%d %H:%M:%S'), e.description, e.feed_id))
     
     db_conn.commit()
     print(f"    新增 {len(new_entries)} 个节点")
